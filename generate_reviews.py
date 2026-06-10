@@ -54,14 +54,10 @@ print(f"Loaded {len(api_keys)} Gemini API Key(s) for rotation: {[mask_key(k) for
 # Create thread-safe pool of clients
 client_queue = queue.Queue()
 for k in api_keys:
-    client_queue.put((genai.Client(api_key=k), k))
+    client_queue.put(genai.Client(api_key=k))
     
 # Thread-safe lock for file writing
 file_lock = threading.Lock()
-
-# Thread-safe tracking of active keys to handle daily quota exhaustion
-active_keys_lock = threading.Lock()
-active_keys = set(api_keys)
 
 # Define Structured Output Schema using Pydantic
 class SeriousnessDetails(BaseModel):
@@ -297,10 +293,7 @@ Perform three tasks:
         
         while not success:
             # Get an available client (this blocks if all clients are currently executing a request)
-            client, api_key = client_queue.get()
-            masked_key = mask_key(api_key)
-            is_rate_limit = False
-            is_daily_quota = False
+            client = client_queue.get()
             try:
                 response = client.models.generate_content(
                     model=model_name,
@@ -337,21 +330,8 @@ Perform three tasks:
                 is_rate_limit = "429" in error_str or "quota" in error_str.lower() or "resourceexhausted" in error_str.lower() or "exhausted" in error_str.lower()
                 
                 if is_rate_limit:
-                    # Check if it is a daily quota exhaustion rather than a transient QPM/RPM rate limit
-                    is_daily_quota = "limit:" in error_str.lower() or "daily" in error_str.lower() or "free_tier_requests" in error_str.lower()
-                    if is_daily_quota:
-                        with active_keys_lock:
-                            if api_key in active_keys:
-                                active_keys.remove(api_key)
-                                print(f"\n  [Quota Exhausted] Key {masked_key} has hit its daily quota. {len(active_keys)} keys remaining in rotation.")
-                            if not active_keys:
-                                print("\n  [Fatal Error] All API keys have exhausted their daily quota. Exiting pipeline.")
-                                os._exit(1)
-                        # Continue to try another key
-                        continue
-                    else:
-                        # Specific key hit rate limit, backoff gently (other keys continue unhindered)
-                        time.sleep(10)
+                    # Specific key hit rate limit, backoff gently (other keys continue unhindered)
+                    time.sleep(10)
                 else:
                     retry_count += 1
                     if retry_count >= 3:
@@ -359,9 +339,8 @@ Perform three tasks:
                         break
                     time.sleep(retry_count * 5)
             finally:
-                # Always return the client to the queue unless it hit daily quota exhaustion
-                if not is_daily_quota:
-                    client_queue.put((client, api_key))
+                # Always return the client to the queue
+                client_queue.put(client)
                 
         return key, chatml_record, drug
 
