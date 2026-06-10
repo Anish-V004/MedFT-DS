@@ -135,13 +135,78 @@ def load_processed_keys(output_path):
             print(f"Warning: Failed to parse existing output file {output_path} ({e}).")
     return processed
 
+def clean_existing_chatml_file(output_path, df, dataset_type, system_prompt):
+    """Cleans existing ChatML output file by removing records with outdated system prompts
+    or where the suspected drug is not mentioned in the narrative."""
+    if not os.path.exists(output_path):
+        return
+        
+    # Build narrative-to-drug mapping from current dataframe to check drug presence
+    narrative_to_drug = {}
+    for idx, row in df.iterrows():
+        if dataset_type == 'biodex':
+            narrative, drug = map_biodex_row(row)
+        else:
+            narrative, drug = map_fda_row(row)
+        if narrative:
+            key = hashlib.md5(narrative.encode('utf-8')).hexdigest()
+            narrative_to_drug[key] = drug
+
+    valid_lines = []
+    removed_count = 0
+    
+    try:
+        with open(output_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                    messages = data.get('messages', [])
+                    if len(messages) < 3:
+                        removed_count += 1
+                        continue
+                        
+                    # Check system prompt
+                    sys_content = messages[0].get('content', '')
+                    if sys_content != system_prompt:
+                        removed_count += 1
+                        continue
+                        
+                    # Extract narrative
+                    user_content = messages[1].get('content', '')
+                    if "\n\nReference Safety Information (RSI):" in user_content:
+                        narrative_part = user_content.split("\n\nReference Safety Information (RSI):")[0]
+                    else:
+                        narrative_part = user_content
+                    clean_narrative = narrative_part.replace("Patient Narrative:\n", "").strip()
+                    key = hashlib.md5(clean_narrative.encode('utf-8')).hexdigest()
+                    
+                    # Look up drug in mapping
+                    drug = narrative_to_drug.get(key)
+                    if not drug:
+                        removed_count += 1
+                        continue
+                        
+                    clean_drug = clean_drug_name_for_api(drug)
+                    if not clean_drug or clean_drug not in clean_narrative.lower():
+                        removed_count += 1
+                        continue
+                        
+                    valid_lines.append(line)
+                except Exception:
+                    removed_count += 1
+                    
+        if removed_count > 0:
+            print(f"  --> Cleaning output file '{output_path}': removed {removed_count} outdated/invalid records.")
+            with open(output_path, 'w', encoding='utf-8') as f_out:
+                f_out.writelines(valid_lines)
+    except Exception as e:
+        print(f"Warning: Failed to clean existing output file {output_path} ({e}).")
+
 def run_dataset_pipeline(df, dataset_type, rsi_mapping, limit=None, model_name='gemini-2.5-flash'):
     """Processes rows through Gemini, formats as ChatML, and appends to output files."""
     output_path = BIODEX_OUTPUT_PATH if dataset_type == 'biodex' else FDA_OUTPUT_PATH
-    processed_keys = load_processed_keys(output_path)
-    
-    print(f"\nProcessing {dataset_type.upper()} dataset. Outputs will be saved to '{output_path}'")
-    print(f"Found {len(processed_keys)} already processed records to skip.")
     
     system_prompt = (
         "You are a Pharmacovigilance (PV) Medical Review Assistant. "
@@ -149,6 +214,14 @@ def run_dataset_pipeline(df, dataset_type, rsi_mapping, limit=None, model_name='
         "Do NOT invent, hallucinate, or bring in external patient cases. Do NOT reference drugs or adverse events that are not explicitly written in the user's prompt. "
         "If the provided RSI does not match the drug in the narrative, explicitly state 'Drug Mismatch - Cannot Evaluate' in your reasoning."
     )
+    
+    # Clean output files of any outdated/invalid records
+    clean_existing_chatml_file(output_path, df, dataset_type, system_prompt)
+    
+    processed_keys = load_processed_keys(output_path)
+    
+    print(f"\nProcessing {dataset_type.upper()} dataset. Outputs will be saved to '{output_path}'")
+    print(f"Found {len(processed_keys)} already processed records to skip.")
     
     # Initialize Gemini model
     model = genai.GenerativeModel(model_name, system_instruction=system_prompt)
@@ -183,7 +256,7 @@ Perform three tasks:
             
         # Programmatic Grounding Check: skip row if suspected drug is not mentioned in the narrative text
         clean_drug = clean_drug_name_for_api(drug)
-        if clean_drug not in narrative.lower():
+        if not clean_drug or clean_drug not in narrative.lower():
             continue
             
         # Deduplication key
