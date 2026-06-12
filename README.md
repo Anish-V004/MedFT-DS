@@ -13,7 +13,7 @@ To prepare a high-quality dataset for LLM fine-tuning, the pipeline enforces sev
 2. **Clinical Representation (Balanced openFDA FAERS)**: To avoid dataset bias from extremely common conditions, the openFDA pipeline divides cardiology adverse events into 6 broad clinical categories and fetches exactly 500 unique reports for each.
 3. **Reference Safety Information (RSI) Grounding**: Fetches safety labels for suspected drugs from the OpenFDA labeling API so that the LLM is grounded in real medical documentation rather than hallucinating expectedness.
 4. **LLM Evaluation (PV Review)**: Automates clinical evaluations using Gemini models to determine Seriousness, Expectedness, and Causality (Naranjo score).
-5. **Data Balancing & Synthetic Negatives**: Compiles a final dataset (`golden_train_3000.jsonl`) that perfectly balances positive cases across Naranjo causality tiers, and explicitly injects 300 synthetic "negative" cases to teach the model how to gracefully handle missing data or non-clinical text.
+5. **Data Balancing & Synthetic Negatives**: Compiles a final dataset (`pv_safety_review_dataset_3000.jsonl`) that perfectly balances positive cases across Naranjo causality tiers, and explicitly injects 300 synthetic "negative" cases to teach the model how to gracefully handle missing data or non-clinical text.
 
 ---
 
@@ -120,7 +120,7 @@ uv run python generate_reviews.py --full-run --openfda
 ```
 
 #### Step D: Compile the Final Balanced Dataset
-Once the LLM extraction is complete, compile the final `golden_train_3000.jsonl` containing positive cases and synthetically injected negative cases.
+Once the LLM extraction is complete, compile the final `pv_safety_review_dataset_3000.jsonl` containing positive cases and synthetically injected negative cases.
 ```bash
 uv run python scripts/compile_dataset.py
 ```
@@ -141,7 +141,7 @@ You can easily load the final generated ChatML dataset into a pandas DataFrame:
 import pandas as pd
 
 # Load the Golden Fine-Tuning Dataset
-df = pd.read_json("data/golden_train_3000.jsonl", lines=True)
+df = pd.read_json("data/pv_safety_review_dataset_3000.jsonl", lines=True)
 print(f"Loaded {len(df)} samples for fine-tuning.")
 
 # Print the first instruction-response pair

@@ -64,11 +64,6 @@ def validate_record(idx, data):
         if field not in json_data:
             return False, f"Missing required field '{field}'."
 
-    # Check 4: meddra_pt sanity
-    meddra_pt = json_data.get('meddra_pt')
-    if not meddra_pt or not isinstance(meddra_pt, str) or meddra_pt.strip().lower() in ('none', '', 'null', 'n/a'):
-        return False, f"Invalid meddra_pt value: '{meddra_pt}'."
-
     # Check 5 & 6: Causality / Naranjo
     causality = json_data.get('causality', {})
     if not isinstance(causality, dict):
@@ -81,8 +76,22 @@ def validate_record(idx, data):
         return False, f"Invalid or missing 'naranjo_score': '{naranjo_score}'."
     if not (-4 <= int(naranjo_score) <= 13):
         return False, f"Naranjo score {naranjo_score} is out of valid range (-4 to +13)."
-    if interpretation.strip().lower() not in VALID_NARANJO_INTERPRETATIONS:
+    
+    interpretation_clean = interpretation.strip().lower()
+    if interpretation_clean not in VALID_NARANJO_INTERPRETATIONS and interpretation_clean != 'unassessable - missing data':
         return False, f"Invalid Naranjo interpretation: '{interpretation}'."
+
+    # Check 4: meddra_pt sanity
+    meddra_pt = json_data.get('meddra_pt')
+    if not meddra_pt or not isinstance(meddra_pt, str):
+        return False, "Missing or invalid meddra_pt type."
+
+    if interpretation_clean == 'unassessable - missing data':
+        if meddra_pt.strip().lower() != 'none':
+            return False, f"Expected meddra_pt to be 'None' for Unassessable case, got '{meddra_pt}'."
+    else:
+        if meddra_pt.strip().lower() in ('none', '', 'null', 'n/a'):
+            return False, f"Invalid meddra_pt value for medical review: '{meddra_pt}'."
 
     # Check seriousness block
     seriousness = json_data.get('seriousness', {})

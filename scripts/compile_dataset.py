@@ -1,10 +1,11 @@
 import os
 import json
 import random
-import re
-import argparse
 import sys
+import argparse
 import pandas as pd
+import numpy as np
+import tiktoken
 
 # Ensure UTF-8 printing on Windows
 sys.stdout.reconfigure(encoding='utf-8')
@@ -17,7 +18,6 @@ SYSTEM_PROMPT = (
     "If the provided RSI does not match the drug in the narrative, explicitly state 'Drug Mismatch - Cannot Evaluate' in your reasoning."
 )
 
-# Admin Noise Templates
 ADMIN_NOISE_TEMPLATES = [
     "Consumer called to ask for a refund for their prescription of {drug}. The package was damaged during shipping.",
     "Medical records were requested for the patient taking {drug} but they have not been provided by the clinical site.",
@@ -28,8 +28,16 @@ ADMIN_NOISE_TEMPLATES = [
     "Insurance billing inquiry: Customer called to check co-pay pricing details for {drug}."
 ]
 
-def parse_valid_review(sample):
-    """Parses a valid ChatML review to extract its metrics for balancing."""
+def calculate_tokens(sample, enc):
+    """Calculates the ChatML formatted token size of a sample."""
+    messages = sample.get('messages', [])
+    full_text = ""
+    for msg in messages:
+        full_text += f"<|im_start|>{msg.get('role', '')}\n{msg.get('content', '')}<|im_end|>\n"
+    return len(enc.encode(full_text))
+
+def parse_valid_review(sample, enc):
+    """Parses a valid ChatML review to extract its metrics and token count for balancing."""
     messages = sample.get('messages', [])
     if len(messages) < 3:
         return None
@@ -39,6 +47,9 @@ def parse_valid_review(sample):
     
     # Identify source
     source = 'openfda' if 'The suspected drug is' in user_content and 'experienced the following adverse events' in user_content else 'biodex'
+    
+    # Check RSI availability
+    rsi_avail = 'RSI not available' not in user_content
     
     # Extract JSON block
     start_idx = assistant_content.find('{')
@@ -50,7 +61,6 @@ def parse_valid_review(sample):
         json_data = json.loads(assistant_content[start_idx:end_idx+1])
         expectedness = json_data.get('expectedness', 'Unexpected')
         causality = json_data.get('causality', {})
-        interpretation = causality.get('interpretation', 'Possible')
         naranjo = causality.get('naranjo_score', 1)
         
         # Categorize Naranjo
@@ -61,11 +71,15 @@ def parse_valid_review(sample):
         else:
             causality_cat = 'Probable/Definite'
             
+        tokens = calculate_tokens(sample, enc)
+            
         return {
             'sample': sample,
             'source': source,
             'expectedness': expectedness,
-            'causality_cat': causality_cat
+            'causality_cat': causality_cat,
+            'rsi_avail': rsi_avail,
+            'tokens': tokens
         }
     except Exception:
         return None
@@ -78,7 +92,6 @@ def generate_negative_cases(count_per_cat=100):
     fda_drugs = ["Lisinopril", "Aspirin", "Humira", "Atorvastatin", "Metoprolol", "Furosemide", "Soliris", "Amlodipine"]
     fda_reactions = ["Myocardial infarction", "Renal failure acute", "Thrombocytopenia", "Cardiac arrest", "Angina pectoris"]
     
-    # Try to load real ones if files exist to make them highly clinical
     if os.path.exists('data/fda_cardio_clinical.csv'):
         try:
             df = pd.read_csv('data/fda_cardio_clinical.csv', nrows=100)
@@ -88,7 +101,7 @@ def generate_negative_cases(count_per_cat=100):
         except Exception:
             pass
             
-    # 1. Missing Drugs (100 samples)
+    # 1. Missing Drugs
     for i in range(count_per_cat):
         age = random.randint(18, 85)
         sex = random.choice(["male", "female"])
@@ -125,7 +138,7 @@ def generate_negative_cases(count_per_cat=100):
             }
         })
 
-    # 2. Missing Events (100 samples)
+    # 2. Missing Events
     for i in range(count_per_cat):
         age = random.randint(18, 85)
         sex = random.choice(["male", "female"])
@@ -162,7 +175,7 @@ def generate_negative_cases(count_per_cat=100):
             }
         })
 
-    # 3. Administrative Noise (100 samples)
+    # 3. Administrative Noise
     for i in range(count_per_cat):
         drug = random.choice(fda_drugs)
         template = random.choice(ADMIN_NOISE_TEMPLATES)
@@ -200,139 +213,161 @@ def generate_negative_cases(count_per_cat=100):
     return samples
 
 def main():
-    parser = argparse.ArgumentParser(description=" Diversified Golden Subset Dataset Balancer & Compiler.")
-    parser.add_argument('--preview', action='store_true',
-                        help="If set, outputs exactly one sample from each of the 6 categories for user review.")
-    parser.add_argument('--output', type=str, default='data/golden_train_3000.jsonl',
-                        help="Path to save the compiled dataset.")
-    parser.add_argument('--size', type=int, default=3000,
-                        help="Total size of the Golden Subset (default 3000).")
-    parser.add_argument('--neg-size', type=int, default=300,
-                        help="Total negative escalation samples to include (default 300).")
+    parser = argparse.ArgumentParser(description="PV Dataset Compiler V2: Limits token count and balances RSI types.")
+    parser.add_argument('--output', type=str, default='data/pv_safety_review_dataset_3000.jsonl',
+                        help="Path to save the new compiled dataset.")
+    parser.add_argument('--max-tokens', type=int, default=6000,
+                        help="Hard maximum token count limit (default 6000).")
+    parser.add_argument('--pref-tokens', type=int, default=4000,
+                        help="Preferred maximum token count limit (default 4000).")
     args = parser.parse_args()
     
     print("==================================================")
-    print("PHARMACOVIGILANCE DIVERSIFIED DATASET COMPILER")
+    print("PHARMACOVIGILANCE DATASET COMPILER V2")
     print("==================================================")
     
-    # 1. Load existing valid reviews
+    enc = tiktoken.get_encoding("cl100k_base")
+    
+    # 1. Load existing reviews
     valid_pool = []
     for fpath in ['data/biodex_chatml.jsonl', 'data/fda_chatml.jsonl']:
         if os.path.exists(fpath):
             with open(fpath, 'r', encoding='utf-8') as f:
                 for line in f:
                     if line.strip():
-                        parsed = parse_valid_review(json.loads(line))
+                        parsed = parse_valid_review(json.loads(line), enc)
                         if parsed:
                             valid_pool.append(parsed)
                             
-    print(f"Loaded {len(valid_pool)} successfully generated valid reviews from pool.")
+    print(f"Loaded {len(valid_pool)} valid reviews from the source pool.")
     
-    # Categorize valid reviews for balancing
+    # Filter by hard token limit
+    filtered_pool = [r for r in valid_pool if r['tokens'] <= args.max_tokens]
+    print(f"Pool size after strictly excluding samples > {args.max_tokens} tokens: {len(filtered_pool)}")
+    
+    # Categorize filtered pool for balancing
     categories = {
-        'Doubtful': [r for r in valid_pool if r['causality_cat'] == 'Doubtful'],
-        'Possible': [r for r in valid_pool if r['causality_cat'] == 'Possible'],
-        'Probable/Definite': [r for r in valid_pool if r['causality_cat'] == 'Probable/Definite']
+        'Doubtful': [r for r in filtered_pool if r['causality_cat'] == 'Doubtful'],
+        'Possible': [r for r in filtered_pool if r['causality_cat'] == 'Possible'],
+        'Probable/Definite': [r for r in filtered_pool if r['causality_cat'] == 'Probable/Definite']
     }
     
-    # 2. Preview Mode
-    if args.preview:
-        print("\n" + "="*70)
-        print("                 PREVIEW: 6-CATEGORY DATASET FORMAT")
-        print("="*70)
-        
-        # Display 1 from each valid category
-        for cat_name, items in categories.items():
-            print(f"\n--- [CATEGORY: Valid Medical Case - {cat_name}] ---")
-            if items:
-                sample = items[0]['sample']
-                print(f"User narrative: {sample['messages'][1]['content'][:300]}...")
-                print(f"Assistant response:\n{sample['messages'][2]['content']}")
-            else:
-                print("  (No valid reviews generated yet in this category. Generate pool first.)")
-            print("-"*70)
-            
-        # Generate and display 1 from each negative category
-        negatives = generate_negative_cases(count_per_cat=1)
-        for neg in negatives:
-            print(f"\n--- [CATEGORY: Negative Escalation Case - {neg['category']}] ---")
-            sample = neg['sample']
-            print(f"User narrative: {sample['messages'][1]['content']}")
-            print(f"Assistant response:\n{sample['messages'][2]['content']}")
-            print("-"*70)
-            
-        # Write previews to a file
-        preview_path = 'data/category_previews.jsonl'
-        with open(preview_path, 'w', encoding='utf-8') as f_out:
-            for cat_name, items in categories.items():
-                if items:
-                    f_out.write(json.dumps(items[0]['sample'], ensure_ascii=False) + '\n')
-            for neg in negatives:
-                f_out.write(json.dumps(neg['sample'], ensure_ascii=False) + '\n')
-                
-        print(f"\nSaved preview samples to '{preview_path}'")
-        return
-
-    # 3. Full Balancing & Compilation Mode
-    target_valid_size = args.size - args.neg_size
-    print(f"\nTarget Split:\n  - Valid Medical Reviews: {target_valid_size} rows\n  - Negative Escalation:   {args.neg_size} rows")
+    target_medical_size = 2700
+    target_neg_size = 300
     
-    if len(valid_pool) < target_valid_size:
-        print(f"\nWARNING: Only {len(valid_pool)} valid reviews generated in pool. Need {target_valid_size}.")
-        print("To build a perfectly balanced dataset of this size, run generate_reviews.py --full-run first.")
-        print("We will compile all available valid reviews and generate the negative rows.")
-        selected_valid = [r['sample'] for r in valid_pool]
-    else:
-        # Perform combinatorial sampling to achieve balance
-        # target counts per causality category
-        per_cat_target = target_valid_size // 3
+    # Target per category if perfectly balanced
+    ideal_per_cat = target_medical_size // 3 # 900
+    
+    # Check the size of Probable/Definite
+    prob_def_pool = categories['Probable/Definite']
+    selected_prob_def = []
+    
+    # For Probable/Definite, we take all we can under args.max_tokens (since total under 6000 is 504)
+    # We prioritize under 4,000 tokens first
+    prob_def_under_pref = [r for r in prob_def_pool if r['tokens'] <= args.pref_tokens]
+    prob_def_above_pref = [r for r in prob_def_pool if r['tokens'] > args.pref_tokens]
+    
+    selected_prob_def += prob_def_under_pref
+    selected_prob_def += prob_def_above_pref
+    
+    num_prob_def = len(selected_prob_def)
+    print(f"Probable/Definite selected: {num_prob_def} (all available under {args.max_tokens} tokens)")
+    print(f"  - Under {args.pref_tokens} tokens: {len(prob_def_under_pref)}")
+    print(f"  - Between {args.pref_tokens} and {args.max_tokens} tokens: {len(prob_def_above_pref)}")
+    
+    # Calculate the remaining target to hit 2,700 total medical reviews
+    shortfall = ideal_per_cat - num_prob_def # 900 - 504 = 396
+    
+    # Split the shortfall between Possible and Doubtful
+    added_per_cat = shortfall // 2 # 198
+    target_doubtful = ideal_per_cat + added_per_cat # 1098
+    target_possible = ideal_per_cat + (shortfall - added_per_cat) # 1098
+    
+    # --- SELECT POSSIBLE (Target: 1098) ---
+    # We want to sample exactly target_possible from Possible pool.
+    # To maximize quality and meet token preferences, we look at the Possible under-pref pool (1,950 records available).
+    # We want a highly diverse split of RSI Available and RSI Not Available (AI-generated knowledge fallback).
+    possible_pool = [r for r in categories['Possible'] if r['tokens'] <= args.pref_tokens]
+    
+    poss_rsi_avail = [r for r in possible_pool if r['rsi_avail']]
+    poss_rsi_not_avail = [r for r in possible_pool if not r['rsi_avail']]
+    
+    # Sample 50% each
+    half_target = target_possible // 2
+    
+    random.seed(42) # Set seed for reproducibility
+    sampled_poss_avail = random.sample(poss_rsi_avail, min(len(poss_rsi_avail), half_target))
+    sampled_poss_not_avail = random.sample(poss_rsi_not_avail, min(len(poss_rsi_not_avail), target_possible - len(sampled_poss_avail)))
+    
+    selected_possible = sampled_poss_avail + sampled_poss_not_avail
+    # If we are still short (unlikely), fill from remainder of the Possible pool
+    if len(selected_possible) < target_possible:
+        remaining = [r for r in categories['Possible'] if r not in selected_possible]
+        selected_possible += random.sample(remaining, target_possible - len(selected_possible))
         
-        selected_valid = []
-        for cat_name, items in categories.items():
-            if len(items) >= per_cat_target:
-                # Sample evenly from Expected/Unexpected if possible
-                expected = [x for x in items if x['expectedness'] == 'Expected']
-                unexpected = [x for x in items if x['expectedness'] == 'Unexpected']
-                
-                half_target = per_cat_target // 2
-                
-                sampled_exp = random.sample(expected, min(len(expected), half_target))
-                sampled_unexp = random.sample(unexpected, min(len(unexpected), per_cat_target - len(sampled_exp)))
-                
-                sampled_items = sampled_exp + sampled_unexp
-                # Fallback to general sample if needed to hit target
-                if len(sampled_items) < per_cat_target:
-                    remaining = [x for x in items if x not in sampled_items]
-                    sampled_items += random.sample(remaining, per_cat_target - len(sampled_items))
-                
-                selected_valid += [x['sample'] for x in sampled_items]
-            else:
-                # Take all we have
-                selected_valid += [x['sample'] for x in items]
-                
-        # Fill in up to target_valid_size if any category was short
-        if len(selected_valid) < target_valid_size:
-            remaining = [r['sample'] for r in valid_pool if r['sample'] not in selected_valid]
-            selected_valid += random.sample(remaining, min(len(remaining), target_valid_size - len(selected_valid)))
-
-    # Generate 300 negative cases (100 per category)
-    neg_count_per_cat = args.neg_size // 3
-    negatives = generate_negative_cases(count_per_cat=neg_count_per_cat)
+    print(f"Possible selected: {len(selected_possible)} (all under {args.pref_tokens} tokens)")
+    print(f"  - RSI Available (standard openFDA label): {len(sampled_poss_avail)}")
+    print(f"  - RSI Not Available (AI-knowledge fallback): {len(sampled_poss_not_avail)}")
+    
+    # --- SELECT DOUBTFUL (Target: 1098) ---
+    # We want to select target_doubtful from Doubtful pool.
+    # Doubtful pool under-pref has 941 records.
+    # We take all 941 under-pref records first.
+    doubtful_under_pref = [r for r in categories['Doubtful'] if r['tokens'] <= args.pref_tokens]
+    doubtful_above_pref = [r for r in categories['Doubtful'] if r['tokens'] > args.pref_tokens]
+    
+    selected_doubtful = list(doubtful_under_pref)
+    needed_doubtful = target_doubtful - len(selected_doubtful) # 1098 - 941 = 157
+    
+    sampled_doubtful_above = random.sample(doubtful_above_pref, min(len(doubtful_above_pref), needed_doubtful))
+    selected_doubtful += sampled_doubtful_above
+    
+    print(f"Doubtful selected: {len(selected_doubtful)}")
+    print(f"  - Under {args.pref_tokens} tokens: {len(doubtful_under_pref)}")
+    print(f"  - Between {args.pref_tokens} and {args.max_tokens} tokens: {len(sampled_doubtful_above)}")
+    
+    # Count RSI status for selected Doubtful
+    doubtful_rsi_avail = sum(1 for r in selected_doubtful if r['rsi_avail'])
+    doubtful_rsi_not_avail = sum(1 for r in selected_doubtful if not r['rsi_avail'])
+    print(f"  - RSI Available (standard openFDA label): {doubtful_rsi_avail}")
+    print(f"  - RSI Not Available (AI-knowledge fallback): {doubtful_rsi_not_avail}")
+    
+    # 2. Generate Negatives (300 total, 100 of each, all under 500 tokens)
+    print(f"\nGenerating {target_neg_size} synthetic negative controls...")
+    negatives = generate_negative_cases(count_per_cat=target_neg_size // 3)
     selected_negatives = [n['sample'] for n in negatives]
     
-    # Combine and shuffle
-    final_dataset = selected_valid + selected_negatives
+    # Extract reviews
+    selected_medical_reviews = [r['sample'] for r in selected_prob_def + selected_possible + selected_doubtful]
+    
+    # 3. Combine and Shuffle
+    final_dataset = selected_medical_reviews + selected_negatives
     random.shuffle(final_dataset)
     
-    # Write to final jsonl
+    # 4. Save to New Dataset File
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     with open(args.output, 'w', encoding='utf-8') as f_out:
         for sample in final_dataset:
             f_out.write(json.dumps(sample, ensure_ascii=False) + '\n')
             
-    print(f"\nCompilation successful! Saved {len(final_dataset)} records to '{args.output}'")
-    print(f"  - Valid reviews: {len(selected_valid)}")
-    print(f"  - Negative reviews: {len(selected_negatives)} ({neg_count_per_cat} of each category)")
+    # Calculate stats of the new dataset
+    final_token_counts = [calculate_tokens(s, enc) for s in final_dataset]
+    mean_len = np.mean(final_token_counts)
+    max_len = np.max(final_token_counts)
+    under_4k_count = sum(1 for c in final_token_counts if c <= args.pref_tokens)
+    
+    print("\n" + "="*50)
+    print("COMPILATION SUMMARY - NEW DATASET")
+    print("="*50)
+    print(f"Output File Path : {args.output}")
+    print(f"Total Records    : {len(final_dataset)}")
+    print(f"  - Medical reviews: {len(selected_medical_reviews)}")
+    print(f"  - Negative reviews: {len(selected_negatives)}")
+    print(f"Average Token Size: {mean_len:.2f} tokens")
+    print(f"Max Token Size    : {max_len} tokens")
+    print(f"Records <= {args.pref_tokens} : {under_4k_count} ({under_4k_count/len(final_dataset)*100:.2f}%)")
+    print(f"Records > {args.pref_tokens}  : {len(final_dataset) - under_4k_count} ({(len(final_dataset) - under_4k_count)/len(final_dataset)*100:.2f}%)")
+    print("="*50)
 
 if __name__ == '__main__':
     main()

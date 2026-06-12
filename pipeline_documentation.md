@@ -6,7 +6,7 @@ This document outlines the full architecture, execution flow, file structures, a
 
 ## 1. High-Level Architecture Overview
 
-The pipeline's goal is to construct a high-quality, balanced, ChatML-formatted training dataset (`data/golden_train_3000.jsonl`) consisting of **3,000 cases** for fine-tuning LLMs on Pharmacovigilance (PV) medical reviews. 
+The pipeline's goal is to construct a high-quality, balanced, ChatML-formatted training dataset (`data/pv_safety_review_dataset_3000.jsonl`) consisting of **3,000 cases** for fine-tuning LLMs on Pharmacovigilance (PV) medical reviews. 
 
 The pipeline extracts cardiology adverse event reports, scrapes official Reference Safety Information (RSI) drug labels, queries the Gemini API for clinical assessments (Seriousness, MedDRA PT, Labeling expectedness, Naranjo causality), validates output structure, and balances the dataset with synthetic negatives.
 
@@ -18,7 +18,7 @@ graph TD
     E -->|extract_rsi.py| F[rsi_mapping.json Cache]
     E & F -->|generate_reviews.py| G[ChatML JSONL Outputs]
     G -->|validate_outputs.py| H[Cleaned Outputs]
-    H -->|compile_dataset.py| I[data/golden_train_3000.jsonl]
+    H -->|compile_dataset.py| I[data/pv_safety_review_dataset_3000.jsonl]
 ```
 
 ---
@@ -113,7 +113,7 @@ graph TD
      * **Administrative Noise**: Non-clinical inquiries (refund requests, shipping damage, prescription status).
      The assistant responses for these negatives output `meddra_pt: "None"` and `causality.interpretation: "Unassessable - Missing Data"`.
   5. Shuffles all 3,000 selected rows and saves the final file.
-  * **Result**: `data/golden_train_3000.jsonl`
+  * **Result**: `data/pv_safety_review_dataset_3000.jsonl`
 
 ---
 
@@ -169,7 +169,7 @@ The patient experienced a myocardial infarction and cardiac arrest while taking 
 4. **openFDA Generation**: **Complete**.
    * Successfully processed all rows; **2,999 valid records** passed validation checks.
 5. **Final Balancing and Validation**: **Complete**.
-   * Output dataset `data/golden_train_3000.jsonl` compiled with exactly **3,000 records** (2,700 medical reviews and 300 synthetic negatives).
+   * Output dataset `data/pv_safety_review_dataset_3000.jsonl` compiled with exactly **3,000 records** (2,700 medical reviews and 300 synthetic negatives).
 
 
 ### Notable Multi-Drug Analysis
